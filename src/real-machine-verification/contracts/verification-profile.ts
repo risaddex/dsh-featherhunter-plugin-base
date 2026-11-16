@@ -1,0 +1,400 @@
+/**
+ * The verification profile: the *only* place a plugin repository states its differences.
+ *
+ * Everything the capability must know about one plugin lives here — its package
+ * name, the profile to verify by default, how to build it, which skills it
+ * registers, which model it expects. Keeping it in one declarative object is what
+ * removes constants like `"web"` or `"D:/.../DeepSeek Harness.exe"` from tool code,
+ * which is exactly how the previous per-repository scripts drifted apart.
+ *
+ * `defineVerificationProfile` validates at the boundary and returns a frozen,
+ * normalized value: a typo in a profile fails at startup with a sentence, not a
+ * mysterious empty report an hour later.
+ */
+import type { CheckId, ProfileName } from "./branding";
+import type { BlockedReason } from "./evidence-contract";
+import { parseCheckId, parseProfileName } from "./branding";
+import { err, ok, type Failure, type Result } from "./result";
+import type { TicketFaceDeclaration } from "./ticket-face";
+
+/** One model the run should use. `apiKeyEnv` names a credential, never holds one. */
+export interface ModelSelection {
+  readonly provider: string;
+  readonly model: string;
+  /** Name of the credential reference, e.g. `MINIMAX_CN_API_KEY`. Never the value. */
+  readonly apiKeyEnv: string;
+  readonly contextWindow?: number;
+  readonly maxTokens?: number;
+  readonly input?: readonly ("text" | "image")[];
+}
+
+/**
+ * The browser adapter a plugin repository injects for page-level checks.
+ *
+ * The core package owns no browser library; the plugin repository owns the
+ * driver. `module` is either a path relative to the repository root (for
+ * example `verify/browser.mjs`) or an installed package name. `exportName`
+ * selects a named export; omitted means the module's default export.
+ */
+export interface BrowserAdapterDeclaration {
+  readonly module: string;
+  readonly exportName?: string;
+}
+
+/** A bundled-skill directory the package ships, and how many skills it must expose. */
+export interface BundledSkillsDeclaration {
+  /** Directory inside the plugin package, `/`-separated, e.g. `bundled-skills`. */
+  readonly dir: string;
+  /** Exact number of skills the set must contain (the set is compared by name). */
+  readonly expected: number;
+}
+
+/** The four states a custom check may report. */
+export type CheckObservationStatus = "pass" | "fail" | "skip" | "blocked";
+
+/**
+ * The observation a custom check returns.
+ *
+ * A custom check has exactly the same reporting surface as a built-in one: it may
+ * pass, fail, skip (the claim does not apply) or block (it could not observe the
+ * product). A blocked observation is not a failure — the report says the run
+ * proved nothing — so it must name a structured `blockedReason`.
+ */
+export interface CheckObservation {
+  /** Legacy shorthand: `true` means pass and `false` means fail. Ignored when `status` is set. */
+  readonly ok?: boolean;
+  /** Explicit state. Takes precedence over `ok`. */
+  readonly status?: CheckObservationStatus;
+  readonly detail: string;
+  readonly expected?: string;
+  readonly actual?: string;
+  readonly hint?: string;
+  /**
+   * Why the check could not observe the product. Required by convention when
+   * `status` is `blocked`; the runner fills a `prerequisite-missing` fallback
+   * rather than inventing a reason. `"platform-unsupported"` is preferred when
+   * the host lacks the facility entirely (no display, no browser engine).
+   */
+  readonly blockedReason?: BlockedReason;
+}
+
+/**
+ * A plugin-specific check. Kept deliberately small: a title, a hard flag, and a
+ * function that observes. The runner owns statuses, timing and evidence.
+ */
+export interface CustomCheck<TContext = unknown> {
+  readonly id: CheckId;
+  readonly title: string;
+  /** Defaults to `true`; a soft check reports but never exits non-zero. */
+  readonly hard?: boolean;
+  readonly run: (context: TContext) => Promise<CheckObservation | boolean> | CheckObservation | boolean;
+}
+
+/** Hooks let a plugin run code at the three moments that are genuinely plugin-shaped. */
+export interface VerificationHooks {
+  beforeLaunch?(context: { readonly home: string; readonly dir: string; readonly profile: ProfileName }): Promise<void> | void;
+  afterLaunch?(context: { readonly instance: unknown }): Promise<void> | void;
+  beforeStop?(context: { readonly instance: unknown }): Promise<void> | void;
+}
+
+/** What a plugin repository writes in `verify/profile.ts`. */
+export interface VerificationProfileInput {
+  /** Stable id for this profile; lowercase kebab-case (used in file names and reports). */
+  readonly id: string;
+  /** npm package name that must be installed into the verified profile. */
+  readonly packageName: string;
+  /** The DSH profile to verify unless a command overrides it. Required: no hidden default. */
+  readonly defaultProfile: string;
+  /** Module inside the installed package that proves which build is present. */
+  readonly clientEntry?: string;
+  /** Directory the plugin writes its cache/logs into, relative to the instance cwd. */
+  readonly pluginCacheDir?: string;
+  /**
+   * Directory name the plugin uses for its own settings under the redirected
+   * `USERPROFILE`/`HOME` (e.g. `<userprofile>/.dsh/<pluginSettingsDir>/settings.yaml`).
+   * Declaring it lets the tool prove the instance cannot rewrite the developer's
+   * real settings; leaving it out means that probe reports `blocked`, never `pass`.
+   */
+  readonly pluginSettingsDir?: string;
+  /** Bundled skills this package registers; `false` means "this plugin registers none". */
+  readonly bundledSkills?: BundledSkillsDeclaration | false;
+  /** Model the run should configure; `false` means "do not touch model configuration". */
+  readonly model?: ModelSelection | false;
+  /**
+   * Browser adapter used by page-level checks; `false` (or omitted) means "no
+   * adapter", and page checks report `blocked` rather than `fail`.
+   */
+  readonly browser?: BrowserAdapterDeclaration | false;
+  /**
+   * Ticket-face adapter used by release checks; `false` (or omitted) means "no
+   * adapter", and release checks report `blocked` rather than `fail`.
+   */
+  readonly ticketFace?: TicketFaceDeclaration | false;
+  /** Workspace backends the plugin understands, in preference order. */
+  readonly workspaceBackends?: readonly string[];
+  /** How to build the package under verification. */
+  readonly build?: { readonly command: string; readonly timeoutMs?: number };
+  /** Environment variables the instance may receive beyond the safe default allowlist. */
+  readonly instanceEnvAllowlist?: readonly string[];
+  readonly hooks?: VerificationHooks;
+  readonly checks?: readonly CustomCheck[];
+}
+
+/** The normalized, frozen profile used everywhere after validation. */
+export interface VerificationProfile {
+  readonly id: string;
+  readonly packageName: string;
+  readonly defaultProfile: ProfileName;
+  readonly clientEntry: string;
+  readonly pluginCacheDir?: string;
+  readonly pluginSettingsDir?: string;
+  readonly bundledSkills: BundledSkillsDeclaration | false;
+  readonly model: ModelSelection | false;
+  readonly browser: BrowserAdapterDeclaration | false;
+  readonly ticketFace: TicketFaceDeclaration | false;
+  readonly workspaceBackends: readonly string[];
+  readonly build?: { readonly command: string; readonly timeoutMs: number };
+  readonly instanceEnvAllowlist: readonly string[];
+  readonly hooks?: VerificationHooks;
+  readonly checks: readonly CustomCheck[];
+}
+
+const PROFILE_ID_RE = /^[a-z][a-z0-9-]{1,63}$/;
+const NPM_PACKAGE_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+/**
+ * A browser adapter module: a package name or a `/`-separated relative module
+ * path. The rule rejects absolute paths and `..` segments, so the declaration
+ * can only name something the plugin repository itself owns.
+ */
+const BROWSER_MODULE_RE = /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*(?:\/(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9._-]+)*$/;
+const JAVASCRIPT_IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const RELATIVE_POSIX_PATH_RE = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+const DIR_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+function invalid(message: string, hint?: string): Result<never> {
+  return err({ code: "invalid-input", message, ...(hint === undefined ? {} : { hint }) });
+}
+
+/** Validate the parts that need it, then freeze. Throws only for adversarial use. */
+export function defineVerificationProfile(input: VerificationProfileInput): VerificationProfile {
+  const result = parseVerificationProfile(input);
+  if (!result.ok) {
+    const failure: Failure = result.error;
+    throw new Error(`verification profile is invalid: ${failure.message}${failure.hint ? ` — ${failure.hint}` : ""}`);
+  }
+  return result.value;
+}
+
+/** Non-throwing variant: use when the profile comes from disk or another process. */
+export function parseVerificationProfile(input: VerificationProfileInput): Result<VerificationProfile> {
+  if (typeof input !== "object" || input === null) {
+    return invalid("profile must be an object", "call defineVerificationProfile({ ... }) in verify/profile.ts");
+  }
+  if (typeof input.id !== "string" || !PROFILE_ID_RE.test(input.id)) {
+    return invalid(`profile id ${JSON.stringify(input.id)} is not lowercase kebab-case`);
+  }
+  if (typeof input.packageName !== "string" || !NPM_PACKAGE_RE.test(input.packageName)) {
+    return invalid(
+      `profile packageName ${JSON.stringify(input.packageName)} is not an npm package name`,
+      "it must match the name field of the plugin's package.json",
+    );
+  }
+  if (typeof input.defaultProfile !== "string") {
+    return invalid("profile defaultProfile is required", "no implicit default is applied");
+  }
+  const defaultProfile = parseProfileName(input.defaultProfile);
+  if (!defaultProfile.ok) return defaultProfile;
+
+  const clientEntry = input.clientEntry ?? "lib/client.js";
+  if (!RELATIVE_POSIX_PATH_RE.test(clientEntry)) {
+    return invalid(
+      `clientEntry ${JSON.stringify(clientEntry)} must be a relative /-separated path inside the package`,
+    );
+  }
+
+  if (input.pluginCacheDir !== undefined && !DIR_NAME_RE.test(input.pluginCacheDir)) {
+    return invalid(
+      `pluginCacheDir ${JSON.stringify(input.pluginCacheDir)} must be a single directory name`,
+      "it is joined under the instance working directory, not an absolute path",
+    );
+  }
+  if (input.pluginSettingsDir !== undefined && !DIR_NAME_RE.test(input.pluginSettingsDir)) {
+    return invalid(
+      `pluginSettingsDir ${JSON.stringify(input.pluginSettingsDir)} must be a single directory name`,
+      "it is joined under the redirected home directory, not an absolute path",
+    );
+  }
+
+  if (input.bundledSkills !== undefined && input.bundledSkills !== false) {
+    const skills = input.bundledSkills;
+    if (!RELATIVE_POSIX_PATH_RE.test(skills.dir)) {
+      return invalid(`bundledSkills.dir ${JSON.stringify(skills.dir)} must be a relative /-separated path`);
+    }
+    if (!Number.isInteger(skills.expected) || skills.expected < 0) {
+      return invalid(`bundledSkills.expected must be a non-negative integer, got ${String(skills.expected)}`);
+    }
+  }
+
+  if (input.model !== undefined && input.model !== false) {
+    const model = input.model;
+    for (const field of ["provider", "model", "apiKeyEnv"] as const) {
+      const value = model[field];
+      if (typeof value !== "string" || value.length === 0) {
+        return invalid(`model.${field} must be a non-empty string`);
+      }
+    }
+    if (model.contextWindow !== undefined && (!Number.isInteger(model.contextWindow) || model.contextWindow <= 0)) {
+      return invalid("model.contextWindow must be a positive integer");
+    }
+    if (model.maxTokens !== undefined && (!Number.isInteger(model.maxTokens) || model.maxTokens <= 0)) {
+      return invalid("model.maxTokens must be a positive integer");
+    }
+  }
+
+  if (input.browser !== undefined && input.browser !== false) {
+    if (typeof input.browser !== "object" || input.browser === null) {
+      return invalid(
+        "browser must be an object { module, exportName? } or false",
+        "omit it, set false, or declare browser: { module: \"verify/browser.mjs\" }",
+      );
+    }
+    if (typeof input.browser.module !== "string" || !BROWSER_MODULE_RE.test(input.browser.module)) {
+      return invalid(
+        `browser.module ${JSON.stringify(input.browser.module)} must be a relative /-separated path or a package name`,
+        "for example verify/browser.mjs or @scope/browser-adapter; absolute paths and .. are rejected",
+      );
+    }
+    if (
+      input.browser.exportName !== undefined &&
+      (typeof input.browser.exportName !== "string" || !JAVASCRIPT_IDENTIFIER_RE.test(input.browser.exportName))
+    ) {
+      return invalid(
+        `browser.exportName ${JSON.stringify(input.browser.exportName)} must be a JavaScript identifier`,
+        "omit it to use the module's default export",
+      );
+    }
+  }
+
+  if (input.ticketFace !== undefined && input.ticketFace !== false) {
+    if (typeof input.ticketFace !== "object" || input.ticketFace === null) {
+      return invalid(
+        "ticketFace must be an object { module, exportName? } or false",
+        "omit it, set false, or declare ticketFace: { module: \"verify/ticket-face.mjs\" }",
+      );
+    }
+    if (typeof input.ticketFace.module !== "string" || !BROWSER_MODULE_RE.test(input.ticketFace.module)) {
+      return invalid(
+        `ticketFace.module ${JSON.stringify(input.ticketFace.module)} must be a relative /-separated path or a package name`,
+        "for example verify/ticket-face.mjs or @scope/ticket-face; absolute paths and .. are rejected",
+      );
+    }
+    if (
+      input.ticketFace.exportName !== undefined &&
+      (typeof input.ticketFace.exportName !== "string" || !JAVASCRIPT_IDENTIFIER_RE.test(input.ticketFace.exportName))
+    ) {
+      return invalid(
+        `ticketFace.exportName ${JSON.stringify(input.ticketFace.exportName)} must be a JavaScript identifier`,
+        "omit it to use the module's default export",
+      );
+    }
+  }
+
+  if (input.build !== undefined) {
+    if (typeof input.build.command !== "string" || input.build.command.trim().length === 0) {
+      return invalid("build.command must be a non-empty shell command");
+    }
+    if (input.build.timeoutMs !== undefined && (!Number.isInteger(input.build.timeoutMs) || input.build.timeoutMs <= 0)) {
+      return invalid("build.timeoutMs must be a positive integer");
+    }
+  }
+
+  if (input.checks !== undefined) {
+    for (const check of input.checks) {
+      const id = parseCheckId(String(check.id));
+      if (!id.ok) return id;
+      if (typeof check.title !== "string" || check.title.trim().length === 0) {
+        return invalid(`check ${check.id} needs a title`);
+      }
+      if (typeof check.run !== "function") {
+        return invalid(`check ${check.id} needs a run function`);
+      }
+    }
+  }
+
+  const workspaceBackends = input.workspaceBackends ?? [];
+  for (const backend of workspaceBackends) {
+    if (typeof backend !== "string" || backend.length === 0) {
+      return invalid("workspaceBackends entries must be non-empty strings");
+    }
+  }
+
+  const instanceEnvAllowlist = input.instanceEnvAllowlist ?? [];
+  for (const name of instanceEnvAllowlist) {
+    if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      return invalid(`instanceEnvAllowlist entry ${JSON.stringify(name)} is not an environment variable name`);
+    }
+  }
+
+  const profile: VerificationProfile = {
+    id: input.id,
+    packageName: input.packageName,
+    defaultProfile: defaultProfile.value,
+    clientEntry,
+    ...(input.pluginCacheDir === undefined ? {} : { pluginCacheDir: input.pluginCacheDir }),
+    ...(input.pluginSettingsDir === undefined ? {} : { pluginSettingsDir: input.pluginSettingsDir }),
+    bundledSkills: input.bundledSkills === false || input.bundledSkills === undefined
+      ? (input.bundledSkills ?? false)
+      : { dir: input.bundledSkills.dir, expected: input.bundledSkills.expected },
+    model: input.model === false || input.model === undefined ? false : { ...input.model },
+    browser: input.browser === false || input.browser === undefined
+      ? false
+      : {
+          module: input.browser.module,
+          ...(input.browser.exportName === undefined ? {} : { exportName: input.browser.exportName }),
+        },
+    ticketFace: input.ticketFace === false || input.ticketFace === undefined
+      ? false
+      : {
+          module: input.ticketFace.module,
+          ...(input.ticketFace.exportName === undefined ? {} : { exportName: input.ticketFace.exportName }),
+        },
+    workspaceBackends: [...workspaceBackends],
+    ...(input.build === undefined
+      ? {}
+      : { build: { command: input.build.command, timeoutMs: input.build.timeoutMs ?? 20 * 60_000 } }),
+    instanceEnvAllowlist: [...instanceEnvAllowlist],
+    ...(input.hooks === undefined ? {} : { hooks: input.hooks }),
+    checks: [...(input.checks ?? [])],
+  };
+
+  return ok(Object.freeze(profile));
+}
+
+/** Resolve the profile a command should run against. */
+export function resolveProfile(
+  profile: VerificationProfile,
+  override: string | undefined,
+): Result<ProfileName> {
+  if (override === undefined) return ok(profile.defaultProfile);
+  return parseProfileName(override);
+}
+
+/** True when the model section was declared (i.e. the run should configure it). */
+export function hasModel(profile: VerificationProfile): boolean {
+  return profile.model !== false;
+}
+
+/** True when the repository declares a browser adapter for page-level checks. */
+export function hasBrowserAdapter(profile: VerificationProfile): boolean {
+  return profile.browser !== false;
+}
+
+/** True when the repository declares a ticket-face adapter for release checks. */
+export function hasTicketFaceAdapter(profile: VerificationProfile): boolean {
+  return profile.ticketFace !== false;
+}
+
+/** True when the plugin ships bundled skills the run must find registered. */
+export function hasBundledSkills(profile: VerificationProfile): boolean {
+  return profile.bundledSkills !== false && profile.bundledSkills.expected > 0;
+}

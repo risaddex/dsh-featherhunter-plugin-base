@@ -1,0 +1,6 @@
+# This repository is a vendored copy of FeatherHunter's packages/base, published
+# as a git dependency so a fork can change the release-gate contract without
+# touching the upstream package. The source is not ours to split, and dist/ is
+# build output, so both are marked here rather than restructured.
+* linguist-vendored
+dist/** linguist-generated
